@@ -1,0 +1,1 @@
+Implementation of particle filter-assisted localization of a robot in Carnegie Mellon's Wean Hall using wheel odometry and LiDAR sensor data for CMU's 16-833 Robot Localization and Mapping HW1. This implementation is for my future records, and should not be used for any purposes that would violate CMU's academic integrity policy. 
