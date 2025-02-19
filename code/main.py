@@ -1,6 +1,15 @@
+'''
+    Adapted from course 16831 (Statistical Techniques).
+    Initially written by Paloma Sodhi (psodhi@cs.cmu.edu), 2018
+    Updated by Wei Dong (weidong@andrew.cmu.edu), 2021
+'''
+
+#!/usr/bin/env python3
 import argparse
-import numpy as np
-import os, glob, imageio
+import torch
+import sys, os
+import matplotlib
+matplotlib.use('Agg')
 from map_reader import MapReader
 from motion_model import MotionModel
 from sensor_model import SensorModel
@@ -8,62 +17,75 @@ from resampling import Resampling
 from matplotlib import pyplot as plt
 import time
 
+def visualize_map(occupancy_map):
+    fig = plt.figure()
+    plt.ion()
+    plt.imshow(occupancy_map.cpu().numpy(), cmap='Greys')
+    plt.axis([0, 800, 0, 800])
+
+
 def visualize_timestep(X_bar, tstep, output_path):
     x_locs = X_bar[:, 0] / 10.0
     y_locs = X_bar[:, 1] / 10.0
-    scat = plt.scatter(x_locs, y_locs, c='r', marker='o',s=10)
+    scat = plt.scatter(x_locs.cpu().numpy(), y_locs.cpu().numpy(), c='r', marker='o')
     plt.savefig('{}/{:04d}.png'.format(output_path, tstep))
-
     plt.pause(0.00001)
     scat.remove()
 
-def init_particles_freespace(num_particles, occupancy_map):
-    X_bar_init = []
-    while len(X_bar_init) < num_particles:
-        y_val = np.random.uniform(3500, 4500)
-        x_val = np.random.uniform(4200, 5200)
-        theta_val = np.random.uniform(-np.pi, np.pi)
-        if abs(occupancy_map[int(np.floor(y_val/10)), int(np.floor(x_val/10))]) < 0.2:
-            X_bar_init.append([x_val, y_val, theta_val, 1])
-    return np.array(X_bar_init)
+
+def init_particles_freespace(num_particles, occupancy_map, device):
+    X_bar_init = torch.empty((num_particles,4), device=device, dtype=torch.float32)
+    for i in range(num_particles):
+        while True:
+            y0 = torch.empty(1, device=device).uniform_(0,7000).item()
+            x0 = torch.empty(1, device=device).uniform_(3000,7000).item()
+            theta0 = torch.empty(1, device=device).uniform_(-torch.pi, torch.pi).item()
+            wt = 1.0/num_particles
+            y_map = int(y0//10)
+            x_map = int(x0//10)
+            if occupancy_map[y_map, x_map] == 0:
+                X_bar_init[i] = torch.tensor([x0, y0, theta0, wt], device=device)
+                break
+    return X_bar_init
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--path_to_map', default='../data/map/wean.dat')
     parser.add_argument('--path_to_log', default='../data/log/robotdata1.log')
-    parser.add_argument('--output', default='results')
-    parser.add_argument('--num_particles', default=10000, type=int)
+    parser.add_argument('--output', default='results_1')
+    parser.add_argument('--num_particles', default=3000, type=int)
     parser.add_argument('--visualize', action='store_true')
+    parser.add_argument('--path_to_raycast_map', default='rays.pt')
     args = parser.parse_args()
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     src_path_map = args.path_to_map
     src_path_log = args.path_to_log
     os.makedirs(args.output, exist_ok=True)
     map_obj = MapReader(src_path_map)
-    occupancy_map = map_obj.get_map()
+    occupancy_map_np = map_obj.get_map()
+    occupancy_map = torch.tensor(occupancy_map_np.copy(), dtype=torch.float32, device=device)
     logfile = open(src_path_log, 'r')
-    motion_model = MotionModel()
-    sensor_model = SensorModel(occupancy_map)
-    resampler = Resampling()
+    motion_model = MotionModel(device)
+    sensor_model = SensorModel(occupancy_map, device, saved_rays_precalc_path=args.path_to_raycast_map)
+    resampler = Resampling(device)
     num_particles = args.num_particles
-    X_bar = init_particles_freespace(num_particles, occupancy_map)
-    
+    X_bar = init_particles_freespace(num_particles, occupancy_map, device)
+    if not os.path.exists(args.path_to_raycast_map):
+        raycast_map = sensor_model.download_ray_mapping()
+        torch.save(raycast_map, args.path_to_raycast_map)
+    else:
+        raycast_map = torch.load(args.path_to_raycast_map, map_location=device)
+        sensor_model.raycast_map = raycast_map
     if args.visualize:
-        fig, ax = plt.subplots(figsize=(8, 8), dpi=100)
-        ax.imshow(occupancy_map, cmap='Greys', origin='lower', extent=[0,800,0,800])
-        ax.set_xlim(0, 800)
-        ax.set_ylim(0, 800)
-    
+        visualize_map(occupancy_map)
+    start = time.time()
     first_time_idx = True
-
     for time_idx, line in enumerate(logfile):
-        if time_idx >= 2218:
-            break
-
         meas_type = line[0]
-        meas_vals = np.fromstring(line[2:], dtype=np.float64, sep=' ')
+        meas_vals = torch.tensor(list(map(float, line[2:].strip().split())), dtype=torch.float32, device=device)
         odometry_robot = meas_vals[0:3]
-        time_stamp = meas_vals[-1]
+        time_stamp = meas_vals[-1].item()
         if meas_type == "L":
             odometry_laser = meas_vals[3:6]
             ranges = meas_vals[6:-1]
@@ -72,56 +94,16 @@ if __name__ == '__main__':
             u_t0 = odometry_robot
             first_time_idx = False
             continue
-        
-        X_bar_new = np.zeros((num_particles, 4), dtype=np.float64)
         u_t1 = odometry_robot
-        for m in range(0, num_particles):
-            """
-            MOTION MODEL
-            """
-            x_t0 = X_bar[m, 0:3]
-            x_t1 = motion_model.update(u_t0, u_t1, x_t0)
-
-            xInt = int(x_t1[0]/10.0)
-            yInt = int(x_t1[1]/10.0)
-
-            if np.abs(occupancy_map[yInt, xInt]) >= 0.2 :
-                w_t = 0
-                probs = 0
-                X_bar_new[m, :] = np.hstack((x_t1, w_t))
-                continue
-
-            """
-            SENSOR MODEL
-            """
-            if (meas_type == "L"):
-                z_t = ranges
-
-                w_t, probs, laserX, laserY = sensor_model.beam_range_finder_model(z_t, x_t1)
-                X_bar_new[m, :] = np.hstack((x_t1, w_t))
-                if args.visualize and num_particles == 1:
-                    visualize_timestep(X_bar, time_idx, args.output)
-
-            else:
-                X_bar_new[m, :] = np.hstack((x_t1, X_bar[m, 3]))
-
-        X_bar = X_bar_new
+        new_states = motion_model.update(u_t0, u_t1, X_bar[:, :3])
+        if meas_type == "L":
+            weight, probs, x_hits, y_hits = sensor_model.beam_range_finder_model(ranges, new_states)
+            X_bar = torch.cat((new_states, weight.view(-1,1)), dim=1)
+        else:
+            X_bar = torch.cat((new_states, X_bar[:, 3].view(-1,1)), dim=1)
         u_t0 = u_t1
-
-        """
-        RESAMPLING
-        """
-        if (meas_type == "L"):
-            X_bar = resampler.low_variance_sampler(X_bar)
-        
-        if args.visualize and num_particles > 1 and time_idx%1==0:
+        X_bar = resampler.adaptive_resample(X_bar)
+        if args.visualize:
             visualize_timestep(X_bar, time_idx, args.output)
-
-    logfile.close()
-
-    if args.visualize:
-        images = []
-        for filename in sorted(os.listdir(args.output)):
-            if filename.endswith(".png"):
-                images.append(imageio.imread(os.path.join(args.output, filename)))
-        imageio.mimsave(os.path.join(args.output, 'output.gif'), images, duration=0.5)
+        print("Processing each data line in {:.2f}s".format(time.time() - start))
+    print("Total time: {}s".format(time.time() - start))
